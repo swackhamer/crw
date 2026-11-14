@@ -1161,117 +1161,32 @@ fn is_machine_token(s: &str) -> bool {
 /// JSON whose long strings are anti-bot sensor payloads (PerimeterX's base64
 /// `ob` field), bundled JavaScript or CSS; taken for prose, they became the
 /// whole markdown of chegg.com and homedepot.com. Judged on the text a reader
-/// would see (article JSON often carries `<p>`, `<strong>` or `&nbsp;`):
-/// prose has little code punctuation, and either spaces between short words
-/// or, in scripts written without spaces (Chinese, Japanese, Thai...), mostly
-/// that script's letters.
+/// would see (article JSON often carries `<p>`, `<strong>` or `&nbsp;`, which
+/// html5ever strips and decodes): code is dense in `{ } ; =`, payloads have no
+/// spaces, and prose has either short words or, in scripts written without
+/// spaces (Chinese, Japanese, Thai...), mostly that script's letters.
 fn looks_like_prose(s: &str) -> bool {
-    let text = visible_text(s);
+    let text = scraper::Html::parse_fragment(s)
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ");
     let chars = text.chars().count();
+    // Parentheses and `<`/`>` are left out: prose uses them, code also has these.
     let code = text
         .chars()
-        .filter(|c| matches!(c, '{' | '}' | ';' | '=' | '(' | ')' | '<' | '>'))
+        .filter(|c| matches!(c, '{' | '}' | ';' | '='))
         .count();
-    if chars == 0 || code * 50 > chars {
+    if chars == 0 || code * 20 > chars {
         return false;
     }
     let unspaced = text.chars().filter(|&c| is_unspaced_script(c)).count();
     if unspaced * 10 >= chars * 3 {
         return true;
     }
-    let words: Vec<&str> = text.split_whitespace().collect();
-    words.len() >= 8 && words.iter().all(|w| w.chars().count() <= 60)
-}
-
-/// `s` as a reader sees it, for [`looks_like_prose`]: HTML tags (`<p>`,
-/// `</strong>`, `<a href="...">`) become a space and entities are decoded. A
-/// numeric reference (`&#32;`, `&#x4E2D;`) becomes its character, a named
-/// space (`&nbsp;`, `&ensp;`, `&thinsp;`...) a space and any other named
-/// entity (`&amp;`, `&rsquo;`) one letter, so its `;` doesn't count as code
-/// punctuation. A `<` that doesn't open a tag (`a < b`) is kept. One pass: a
-/// scan for a tag's `>` stops at the next `<` and resumes there.
-fn visible_text(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let (mut i, mut copied) = (0, 0);
-    while i < b.len() {
-        match b[i] {
-            b'<' => {
-                let name = if b.get(i + 1) == Some(&b'/') {
-                    i + 2
-                } else {
-                    i + 1
-                };
-                if !b.get(name).is_some_and(u8::is_ascii_alphabetic) {
-                    i += 1;
-                    continue;
-                }
-                let mut j = name;
-                while j < b.len() && b[j] != b'>' && b[j] != b'<' {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'>') {
-                    out.push_str(&s[copied..i]);
-                    out.push(' ');
-                    copied = j + 1;
-                    i = j + 1;
-                } else {
-                    i = j;
-                }
-            }
-            b'&' => {
-                let end = b[i + 1..]
-                    .iter()
-                    .take(10)
-                    .position(|&c| c == b';')
-                    .map(|p| i + 1 + p);
-                match end.and_then(|e| Some((decode_entity(&s[i + 1..e])?, e))) {
-                    Some((c, e)) => {
-                        out.push_str(&s[copied..i]);
-                        out.push(c);
-                        copied = e + 1;
-                        i = e + 1;
-                    }
-                    _ => i += 1,
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    out.push_str(&s[copied..]);
-    out
-}
-
-/// The character an entity body (between `&` and `;`) stands for in
-/// [`visible_text`], or `None` if it isn't one.
-fn decode_entity(name: &str) -> Option<char> {
-    if let Some(num) = name.strip_prefix('#') {
-        let code = match num.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => num.parse().ok()?,
-        };
-        let c = char::from_u32(code)?;
-        return Some(if c.is_whitespace() { ' ' } else { c });
-    }
-    if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    let space = matches!(
-        name,
-        "nbsp"
-            | "ensp"
-            | "emsp"
-            | "emsp13"
-            | "emsp14"
-            | "thinsp"
-            | "hairsp"
-            | "numsp"
-            | "puncsp"
-            | "MediumSpace"
-            | "NewLine"
-            | "Tab"
-    );
-    Some(if space { ' ' } else { 'x' })
+    // An average word under 20 characters: one long URL in a paragraph is fine,
+    // a base64 blob or minified bundle with a few spaces is not.
+    chars <= text.split_whitespace().count() * 20
 }
 
 /// Letters of scripts that don't put spaces between words.
@@ -1567,59 +1482,24 @@ mod private_tests {
             "if (a < b && c > d) { x = y; } else { z = (w); } return t; function q() { r = s; }"
         ));
     }
-
     #[test]
-    fn prose_check_decodes_entities() {
+    fn prose_check_keeps_ordinary_prose() {
+        // Parentheses, a semicolon, one long URL, entities: all normal prose.
+        let parens = "The 14-inch model (2560x1600) ships with 16 GB of memory (upgradeable to 64 GB); the 16-inch one (3456x2234) adds a second fan (and a larger battery).";
+        assert!(looks_like_prose(parens));
+        let url = "Read the full report at https://www.example.com/reports/2026/annual/financial-statements-and-notes-to-the-accounts-final.pdf before the meeting on Thursday.";
+        assert!(looks_like_prose(url));
         let plain = "The council voted on Tuesday to extend the library's opening hours, and residents said the change would help students and shift workers.";
-        assert!(looks_like_prose(plain));
         assert!(looks_like_prose(&plain.replace(' ', "&nbsp;")));
-        assert!(looks_like_prose(
-            &plain.replace(' ', "&#160;").replace('\'', "&#8217;")
-        ));
         assert!(looks_like_prose(
             &plain
                 .replace("library's", "library&rsquo;s")
                 .replace(" and ", " &amp; ")
         ));
-        // A stray ampersand or semicolon is not an entity.
-        assert_eq!(
-            visible_text("Tom & Jerry; a&b c&#;d"),
-            "Tom & Jerry; a&b c&#;d"
-        );
-    }
-
-    #[test]
-    fn prose_check_decodes_numeric_and_space_entities() {
-        let plain = "The council voted on Tuesday to extend the library's opening hours, and residents said the change would help students and shift workers.";
-        for space in ["&#32;", "&#x20;", "&ensp;", "&emsp;", "&thinsp;"] {
-            assert!(
-                looks_like_prose(&plain.replace(' ', space)),
-                "spaces as {space}"
-            );
-        }
-        let zh = "市议会周二投票决定延长图书馆的开放时间。居民表示，延长晚间开放时间将有助于学生和轮班工人，试点计划将持续到春季。";
-        let encoded: String = zh.chars().map(|c| format!("&#{};", c as u32)).collect();
-        assert!(looks_like_prose(&encoded), "decimal references");
-        let hex: String = zh.chars().map(|c| format!("&#x{:X};", c as u32)).collect();
-        assert!(looks_like_prose(&hex), "hex references");
-        assert_eq!(
-            visible_text("a&#60;b &#xZZ; &#1114112; &bogus-name;"),
-            "a<b &#xZZ; &#1114112; &bogus-name;"
-        );
-    }
-
-    #[test]
-    fn visible_text_is_one_pass() {
-        // Unclosed `<` runs used to be rescanned to the end each time.
-        let field = format!("Updated: {}", "<".repeat(400_000));
-        let started = std::time::Instant::now();
-        assert!(!looks_like_prose(&field));
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
-        assert_eq!(visible_text("a <b <i>x</i> c<d"), "a <b  x  c<d");
-        assert_eq!(
-            visible_text("x < y and <a href=\"/m\">link</a>"),
-            "x < y and  link "
-        );
+        // A spaced non-Latin sentence with few words but 120+ bytes.
+        assert!(looks_like_prose(
+            "Городской совет во вторник продлил часы работы библиотеки до позднего вечера."
+        ));
     }
 
     #[test]
