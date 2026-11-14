@@ -1058,7 +1058,8 @@ impl std::fmt::Debug for FallbackRenderer {
 ///
 /// It also only fires when an earlier tier left a Cloudflare challenge body
 /// behind, and camoufox reports a challenge as an error, never as a body. So
-/// the reserve pays off in exactly one shape: `mode = "auto"` with camoufox in
+/// the reserve pays off in exactly one shape: `mode = "auto"` (or `"chrome"`,
+/// which runs camoufox after chrome the same way) with camoufox in
 /// the ladder, where chrome ran first. A camoufox pin or `mode = "camoufox"`
 /// runs nothing before it, the arm is unreachable, and holding time back would
 /// only cut the poll short. A pin issued on a deployment that also has
@@ -1076,8 +1077,8 @@ fn camoufox_challenge_reserve_ms(config: &RendererConfig) -> Option<u64> {
         .cloak
         .as_ref()
         .is_some_and(|c| !c.base_url.trim().is_empty());
-    let camoufox_after_a_ladder =
-        matches!(config.mode, RendererMode::Auto) && config.camoufox_in_ladder();
+    let camoufox_after_a_ladder = matches!(config.mode, RendererMode::Auto | RendererMode::Chrome)
+        && config.camoufox_in_ladder();
     (camoufox_after_a_ladder && cloak_configured && !config.cloak_recover_on_cf)
         .then_some(crw_core::config::CLOAK_ARM_FLOOR_MS + camoufox::POLL_HANDOFF_MS)
 }
@@ -11583,6 +11584,11 @@ mod camoufox_reserve_tests {
         assert_eq!(camoufox_challenge_reserve_ms(&recover_on_cf), None);
         let held_out_of_auto = cfg(RendererMode::Auto, false, "http://cloak:8000", false);
         assert_eq!(camoufox_challenge_reserve_ms(&held_out_of_auto), None);
+        let chrome_in_ladder = cfg(RendererMode::Chrome, true, "http://cloak:8000", false);
+        assert_eq!(
+            camoufox_challenge_reserve_ms(&chrome_in_ladder),
+            camoufox_challenge_reserve_ms(&auto_in_ladder)
+        );
         let camoufox_mode = cfg(RendererMode::Camoufox, true, "http://cloak:8000", false);
         assert_eq!(camoufox_challenge_reserve_ms(&camoufox_mode), None);
         let no_cloak = cfg(RendererMode::Auto, true, "  ", false);
